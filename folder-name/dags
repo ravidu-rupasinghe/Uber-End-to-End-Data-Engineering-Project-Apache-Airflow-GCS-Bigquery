@@ -1,0 +1,181 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.operators.bigquery import (
+    BigQueryCreateEmptyDatasetOperator, BigQueryCreateEmptyTableOperator, BigQueryInsertJobOperator
+)
+from datetime import datetime
+import requests
+import pandas as pd
+import io
+from google.oauth2 import service_account
+from google.cloud import bigquery
+
+# Function to extract data from Google Cloud Storage
+def extract_data():
+    url = "#put url"
+
+    # Request the CSV file from GCS
+    response = requests.get(url)
+    content = response.content.decode('utf-8')
+
+    # Read the CSV content into a pandas DataFrame
+    df = pd.read_csv(io.StringIO(content))
+
+    # Save the extracted data as a CSV temporarily for later use
+    df.to_csv('/tmp/extracted_uber_data.csv', index=False)
+    print("Data successfully extracted.")
+    return True
+
+# Function to transform data
+def transform_data():
+    df = pd.read_csv('/tmp/extracted_uber_data.csv')
+
+    # Transformation logic
+    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
+    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'])
+
+    datetime_dim = df[['tpep_pickup_datetime', 'tpep_dropoff_datetime']].drop_duplicates().reset_index(drop=True)
+    datetime_dim['datetime_id'] = datetime_dim.index
+    datetime_dim['pick_hour'] = datetime_dim['tpep_pickup_datetime'].dt.hour
+    datetime_dim['pick_day'] = datetime_dim['tpep_pickup_datetime'].dt.day
+    datetime_dim['pick_month'] = datetime_dim['tpep_pickup_datetime'].dt.month
+    datetime_dim['pick_year'] = datetime_dim['tpep_pickup_datetime'].dt.year
+    datetime_dim['pick_weekday'] = datetime_dim['tpep_pickup_datetime'].dt.weekday
+    datetime_dim['drop_hour'] = datetime_dim['tpep_dropoff_datetime'].dt.hour
+    datetime_dim['drop_day'] = datetime_dim['tpep_dropoff_datetime'].dt.day
+    datetime_dim['drop_month'] = datetime_dim['tpep_dropoff_datetime'].dt.month
+    datetime_dim['drop_year'] = datetime_dim['tpep_dropoff_datetime'].dt.year
+    datetime_dim['drop_weekday'] = datetime_dim['tpep_dropoff_datetime'].dt.weekday
+
+    passenger_count_dim = df[['passenger_count']].drop_duplicates().reset_index(drop=True)
+    passenger_count_dim['passenger_count_id'] = passenger_count_dim.index
+
+    trip_distance_dim = df[['trip_distance']].drop_duplicates().reset_index(drop=True)
+    trip_distance_dim['trip_distance_id'] = trip_distance_dim.index
+
+    rate_code_type = {
+        1: "Standard rate", 2: "JFK", 3: "Newark", 4: "Nassau or Westchester",
+        5: "Negotiated fare", 6: "Group ride"
+    }
+    rate_code_dim = df[['RatecodeID']].drop_duplicates().reset_index(drop=True)
+    rate_code_dim['rate_code_id'] = rate_code_dim.index
+    rate_code_dim['rate_code_name'] = rate_code_dim['RatecodeID'].map(rate_code_type)
+
+    pickup_location_dim = df[['pickup_longitude', 'pickup_latitude']].drop_duplicates().reset_index(drop=True)
+    pickup_location_dim['pickup_location_id'] = pickup_location_dim.index
+
+    dropoff_location_dim = df[['dropoff_longitude', 'dropoff_latitude']].drop_duplicates().reset_index(drop=True)
+    dropoff_location_dim['dropoff_location_id'] = dropoff_location_dim.index
+
+    payment_type_name = {
+        1: "Credit card", 2: "Cash", 3: "No charge", 4: "Dispute", 5: "Unknown", 6: "Voided trip"
+    }
+    payment_type_dim = df[['payment_type']].drop_duplicates().reset_index(drop=True)
+    payment_type_dim['payment_type_id'] = payment_type_dim.index
+    payment_type_dim['payment_type_name'] = payment_type_dim['payment_type'].map(payment_type_name)
+
+    fact_table = df.merge(passenger_count_dim, on='passenger_count', how='left') \
+                    .merge(trip_distance_dim, on='trip_distance', how='left') \
+                    .merge(rate_code_dim, on='RatecodeID', how='left') \
+                    .merge(pickup_location_dim, on=['pickup_longitude', 'pickup_latitude'], how='left') \
+                    .merge(dropoff_location_dim, on=['dropoff_longitude', 'dropoff_latitude'], how='left') \
+                    .merge(datetime_dim, on=['tpep_pickup_datetime', 'tpep_dropoff_datetime'], how='left') \
+                    .merge(payment_type_dim, on='payment_type', how='left') \
+                    [['VendorID', 'datetime_id', 'passenger_count_id', 'trip_distance_id', 
+                      'rate_code_id', 'store_and_fwd_flag', 'pickup_location_id', 
+                      'dropoff_location_id', 'payment_type_id', 'fare_amount', 'extra', 
+                      'mta_tax', 'tip_amount', 'tolls_amount', 'improvement_surcharge', 'total_amount']]
+
+    fact_table.to_csv('/tmp/transformed_uber_data.csv', index=False)
+    print("Data successfully transformed.")
+    return True
+
+def load_data_to_bigquery():
+    df = pd.read_csv('/tmp/transformed_uber_data.csv')
+
+    credentials_path = '/opt/airflow/config/uber-project-438314-201430af0900.json'
+    project_id = "#put project id"  
+    dataset_id = "#put dataset id id"
+    table_id = "#put project id"
+
+    credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    client = bigquery.Client(credentials=credentials, project=project_id)
+
+    # Load the CSV data into BigQuery
+    table_ref = client.dataset(dataset_id).table(table_id)
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.CSV, 
+        skip_leading_rows=1,  # Assuming your CSV has a header row
+        autodetect=True
+    )
+
+    with open('/tmp/transformed_uber_data.csv', 'rb') as file:
+        load_job = client.load_table_from_file(file, table_ref, job_config=job_config)
+    
+    load_job.result()  # Wait for the job to complete
+    print("Data loaded successfully into BigQuery.")
+
+# Default arguments for the DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 10, 11),
+    'retries': 1,
+}
+
+# Define the DAG
+with DAG(
+    'uber_etl_dag',
+    default_args=default_args,
+    schedule_interval='@daily',
+    catchup=False,
+) as dag:
+
+    extract_task = PythonOperator(
+        task_id='extract_data',
+        python_callable=extract_data,
+    )
+
+    transform_task = PythonOperator(
+        task_id='transform_data',
+        python_callable=transform_data,
+    )
+
+    load_task = PythonOperator(
+        task_id='load_data_to_bigquery',
+        python_callable=load_data_to_bigquery,
+    )
+
+    create_dataset = BigQueryCreateEmptyDatasetOperator(
+        task_id="create_dataset",
+        dataset_id="uber_data_project_ravi",
+        project_id="put project id"  #put project id
+    )
+
+    create_table = BigQueryCreateEmptyTableOperator(
+        task_id="create_table",
+        dataset_id="uber_data_project_ravi",
+        table_id="fact_table",
+        schema_fields=[
+            {"name": "VendorID", "type": "STRING", "mode": "NULLABLE"},  
+            {"name": "datetime_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "passenger_count_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "trip_distance_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "rate_code_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "store_and_fwd_flag", "type": "STRING", "mode": "NULLABLE"},  
+            {"name": "pickup_location_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "dropoff_location_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "payment_type_id", "type": "INTEGER", "mode": "NULLABLE"},  
+            {"name": "fare_amount", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "extra", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "mta_tax", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "tip_amount", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "tolls_amount", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "improvement_surcharge", "type": "FLOAT", "mode": "NULLABLE"},  
+            {"name": "total_amount", "type": "FLOAT", "mode": "NULLABLE"},  
+        ],
+        project_id="put project id" #put project id
+    )
+
+    # Task dependencies: Create dataset, then table, then ETL steps
+    create_dataset >> create_table >> extract_task >> transform_task >> load_task
